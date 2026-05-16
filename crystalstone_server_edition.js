@@ -16,6 +16,7 @@ const WEBSOCKET_PRICE_PER_MINUTE_RUB = 0.50;
 const WS_RECONNECT_DELAY_MS = 1200;
 const WS_RECONNECT_MAX_ATTEMPTS = 1;
 const CALL_RECORD_ENABLED = true;
+const BACKEND_URL_FALLBACK = '';
 
 VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
     let geminiLiveAPIClient;
@@ -1046,6 +1047,9 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
             backendUrl = safeString(backendUrlEntry && backendUrlEntry.value)
                 .trim()
                 .replace(/\/+$/, '');
+            if (!backendUrl) {
+                backendUrl = safeString(BACKEND_URL_FALLBACK).trim().replace(/\/+$/, '');
+            }
             backendWebhookSecret = safeString(
                 (backendSecretEntry && backendSecretEntry.value) || (backendSecretLegacyEntry && backendSecretLegacyEntry.value)
             ).trim();
@@ -1057,10 +1061,15 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
                     hasGeminiKey: Boolean(GEMINI_API_KEY),
                     geminiKeySource: GEMINI_API_KEY_SOURCE || 'none',
                     backendUrl: backendUrl || 'not_configured',
+                    backendUrlSource: safeString(backendUrlEntry && backendUrlEntry.value).trim() ? 'application_storage' : safeString(BACKEND_URL_FALLBACK).trim() ? 'script_fallback' : 'none',
                     hasBackendSecret: Boolean(backendWebhookSecret),
                     callerPhone
                 })
             );
+            if (!backendUrl) {
+                Logger.write('===NO_BACKEND_URL_CONFIGURED===');
+                Logger.write('Set ApplicationStorage key BACKEND_URL or define BACKEND_URL_FALLBACK in script.');
+            }
 
             if (callConnected) {
                 sendCallStartedToBackend('config_loaded');
@@ -1161,6 +1170,7 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
 «Да, конечно»
 «Хорошо»
 «Угу»
+«Ага»
 «Так, записываю»
 «Спасибо»
 «Ясно»
