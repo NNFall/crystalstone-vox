@@ -1,0 +1,621 @@
+import asyncio
+import json
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+import aiohttp
+from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from database import Call, SessionLocal
+
+BASE_DIR = Path(__file__).resolve().parent
+LOG_PATH = BASE_DIR / "backend.log"
+RECORDINGS_DIR = BASE_DIR / "recordings"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
+)
+logger = logging.getLogger("crystal_stone_backend")
+
+load_dotenv(BASE_DIR / ".env")
+
+PROJECT_NAME = "crystal_stone"
+BACKEND_WEBHOOK_SECRET = os.getenv("BACKEND_WEBHOOK_SECRET", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+TELEGRAM_USER_CHAT_IDS_STR = os.getenv("TELEGRAM_USER_CHAT_IDS", "")
+GOOGLE_APPS_SCRIPT_WEBHOOK_URL = os.getenv("GOOGLE_APPS_SCRIPT_WEBHOOK_URL", "").strip()
+RECORDINGS_TTL_DAYS = int(os.getenv("RECORDINGS_TTL_DAYS", "30"))
+CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
+
+RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+
+bot: Optional[Bot] = None
+if TELEGRAM_BOT_TOKEN:
+    bot = Bot(
+        token=TELEGRAM_BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+else:
+    logger.warning("TELEGRAM_BOT_TOKEN is not configured. Telegram delivery is disabled.")
+
+scheduler = AsyncIOScheduler()
+
+
+class CallStartedPayload(BaseModel):
+    session_id: str
+    project: str = PROJECT_NAME
+    script_name: Optional[str] = None
+    caller_phone: Optional[str] = None
+    connected_at_utc: Optional[str] = None
+
+
+class CallFinishedPayload(BaseModel):
+    session_id: str
+    duration: Optional[int] = None
+    summary: Optional[str] = None
+    finished_at_utc: Optional[str] = None
+    status: Optional[str] = None
+
+
+class RecordingReadyPayload(BaseModel):
+    session_id: str
+    project: str = PROJECT_NAME
+    script_name: Optional[str] = None
+    recording_url: str
+    recording_status: Optional[str] = None
+    recording_error: Optional[str] = None
+
+
+class CallReportPayload(BaseModel):
+    report_type: str
+    text: str
+    call_id: Optional[str] = None
+
+
+class FinalizePayload(BaseModel):
+    session_id: str
+    project: str = PROJECT_NAME
+    script_name: Optional[str] = None
+    exported_at_utc: Optional[str] = None
+    finalization_reason: Optional[str] = None
+    model: Optional[str] = None
+    caller_phone: Optional[str] = None
+    client_phone: Optional[str] = None
+    client_name: Optional[str] = None
+    call_duration_sec: Optional[int] = None
+    telephony_cost_rub: Optional[float] = None
+    websocket_duration_sec: Optional[float] = None
+    websocket_cost_rub: Optional[float] = None
+    voximplant_total_rub: Optional[float] = None
+    ai_cost_usd: Optional[float] = None
+    ai_cost_rub: Optional[float] = None
+    total_cost_rub: Optional[float] = None
+    summary: Optional[str] = None
+    call_goal: Optional[str] = None
+    manager_offer: Optional[str] = None
+    outcome: Optional[str] = None
+    next_step: Optional[str] = None
+    dialogue_text: Optional[str] = None
+    recording_status: Optional[str] = None
+    recording_url: Optional[str] = None
+    recording_error: Optional[str] = None
+    usage: dict[str, Any] = Field(default_factory=dict)
+    summary_fields: dict[str, Any] = Field(default_factory=dict)
+    dialogue_items: list[dict[str, Any]] = Field(default_factory=list)
+    admin_report_html: Optional[str] = None
+    summary_report_html: Optional[str] = None
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def safe_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def safe_float(value: Any) -> Optional[float]:
+    if value in ("", None):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
+
+
+def safe_int(value: Any) -> Optional[int]:
+    if value in ("", None):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def to_json_text(value: Any) -> Optional[str]:
+    if value in (None, "", [], {}):
+        return None
+    return json.dumps(value, ensure_ascii=False)
+
+
+def parse_iso_datetime(value: Any) -> Optional[datetime]:
+    text = safe_text(value).strip()
+    if not text:
+        return None
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo:
+        return parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def normalize_chat_ids(raw_value: str) -> list[str]:
+    normalized = safe_text(raw_value).replace(";", ",").replace("\n", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
+def dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def get_admin_chat_ids() -> list[str]:
+    return normalize_chat_ids(TELEGRAM_ADMIN_CHAT_ID)
+
+
+def get_summary_chat_ids() -> list[str]:
+    return dedupe(get_admin_chat_ids() + normalize_chat_ids(TELEGRAM_USER_CHAT_IDS_STR))
+
+
+def require_webhook_secret(request: Request):
+    if not BACKEND_WEBHOOK_SECRET:
+        return
+
+    supplied = request.headers.get("X-Webhook-Secret", "").strip()
+    if supplied != BACKEND_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="invalid webhook secret")
+
+
+def get_or_create_call(db: Session, session_id: str) -> Call:
+    db_call = db.query(Call).filter(Call.voximplant_session_id == session_id).first()
+    if db_call:
+        return db_call
+
+    db_call = Call(
+        voximplant_session_id=session_id,
+        status="started",
+        started_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(db_call)
+    db.flush()
+    return db_call
+
+
+def set_if_value(obj: Any, field_name: str, value: Any):
+    if value in ("", None):
+        return
+    setattr(obj, field_name, value)
+
+
+def render_admin_report(payload: FinalizePayload) -> str:
+    lines = [
+        "<b>Звонок завершен</b>",
+        f"<b>Номер:</b> {safe_text(payload.client_phone or payload.caller_phone or 'неизвестно')}",
+        f"<b>Длительность:</b> {safe_text(payload.call_duration_sec or 0)} сек",
+        f"<b>Телефония:</b> {safe_text(payload.voximplant_total_rub or payload.telephony_cost_rub or 0)} руб",
+        f"<b>AI:</b> {safe_text(payload.ai_cost_rub or 0)} руб ({safe_text(payload.ai_cost_usd or 0)} USD)",
+        f"<b>Итоговая стоимость:</b> {safe_text(payload.total_cost_rub or payload.voximplant_total_rub or payload.telephony_cost_rub or 0)} руб",
+    ]
+
+    if payload.recording_url:
+        lines.append(f"<b>Запись:</b> {payload.recording_url}")
+
+    lines.extend(
+        [
+            "",
+            "<b>Токены:</b>",
+            safe_text(payload.usage),
+            "",
+            "<b>Диалог:</b>",
+            safe_text(payload.dialogue_text or "Реплики не найдены."),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_summary_report(payload: FinalizePayload) -> str:
+    lines = [
+        "<b>Новый звонок (суммаризация)</b>",
+        f"<b>Номер:</b> {safe_text(payload.client_phone or payload.caller_phone or 'неизвестно')}",
+        f"<b>Имя:</b> {safe_text(payload.client_name or 'не указано')}",
+        f"<b>Запрос:</b> {safe_text(payload.call_goal or 'не указано')}",
+        f"<b>Что предложили:</b> {safe_text(payload.manager_offer or 'не указано')}",
+        f"<b>Итог:</b> {safe_text(payload.outcome or 'не указано')}",
+        f"<b>Следующий шаг:</b> {safe_text(payload.next_step or 'не указано')}",
+    ]
+    if payload.recording_url:
+        lines.append(f"<b>Запись:</b> {payload.recording_url}")
+    lines.extend(["", f"<b>Кратко:</b> {safe_text(payload.summary or 'не указано')}"])
+    return "\n".join(lines)
+
+
+async def send_telegram_text(chat_ids: list[str], html_text: str) -> tuple[str, Optional[str]]:
+    if not chat_ids:
+        return "no_recipients", None
+    if not html_text:
+        return "empty_message", None
+    if bot is None:
+        return "skipped_no_bot", None
+
+    errors: list[str] = []
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id=chat_id, text=html_text, disable_web_page_preview=True)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{chat_id}: {exc}")
+            logger.exception("Failed to send Telegram message to %s", chat_id)
+
+    if errors and len(errors) == len(chat_ids):
+        return "error", "; ".join(errors)
+    if errors:
+        return "partial", "; ".join(errors)
+    return "sent", None
+
+
+async def send_to_google_sheets(payload: dict[str, Any]) -> tuple[str, Optional[str]]:
+    if not GOOGLE_APPS_SCRIPT_WEBHOOK_URL:
+        return "skipped_no_url", None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(GOOGLE_APPS_SCRIPT_WEBHOOK_URL, json=payload) as response:
+                response_text = await response.text()
+                if response.status >= 400:
+                    return "error", f"HTTP {response.status}: {response_text[:1000]}"
+                return "sent", response_text[:4000]
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to sync payload with Google Sheets")
+        return "error", str(exc)
+
+
+def guess_recording_extension(url: str) -> str:
+    parsed_path = urlparse(url).path.lower()
+    for extension in (".mp3", ".wav", ".ogg", ".m4a"):
+        if parsed_path.endswith(extension):
+            return extension
+    return ".mp3"
+
+
+async def download_recording(url: str, session_id: str) -> tuple[str, Optional[str], Optional[str]]:
+    extension = guess_recording_extension(url)
+    file_path = RECORDINGS_DIR / f"{session_id}{extension}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status >= 400:
+                    return "download_error", None, f"HTTP {response.status}"
+                file_path.write_bytes(await response.read())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to download recording for %s", session_id)
+        return "download_error", None, str(exc)
+
+    return "downloaded", str(file_path), None
+
+
+async def persist_recording_download(session_id: str, url: str):
+    status, local_path, error_text = await download_recording(url, session_id)
+    db = SessionLocal()
+    try:
+        db_call = db.query(Call).filter(Call.voximplant_session_id == session_id).first()
+        if not db_call:
+            return
+        if local_path:
+            db_call.local_recording_path = local_path
+        if error_text:
+            db_call.last_error = error_text
+        if db_call.recording_status in (None, "", "not_started", "requested_not_confirmed"):
+            db_call.recording_status = status
+        db_call.updated_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+async def cleanup_old_recordings():
+    logger.info("Starting scheduled cleanup of old recordings")
+    cutoff = time.time() - (RECORDINGS_TTL_DAYS * 86400)
+    removed_files = 0
+    db = SessionLocal()
+
+    try:
+        for file_path in RECORDINGS_DIR.iterdir():
+            if not file_path.is_file():
+                continue
+            if file_path.stat().st_mtime >= cutoff:
+                continue
+
+            file_path.unlink(missing_ok=True)
+            removed_files += 1
+
+            session_id = file_path.stem
+            db_call = db.query(Call).filter(Call.voximplant_session_id == session_id).first()
+            if db_call:
+                db_call.local_recording_path = None
+                db_call.updated_at = datetime.utcnow()
+
+        db.commit()
+        logger.info("Cleanup finished, removed %s recordings", removed_files)
+    except Exception:  # noqa: BLE001
+        logger.exception("Cleanup failed")
+    finally:
+        db.close()
+
+
+def fill_call_from_finalize(db_call: Call, payload: FinalizePayload):
+    now = datetime.utcnow()
+
+    set_if_value(db_call, "project", payload.project)
+    set_if_value(db_call, "script_name", payload.script_name)
+    set_if_value(db_call, "model", payload.model)
+    set_if_value(db_call, "caller_phone", payload.caller_phone)
+    set_if_value(db_call, "client_phone", payload.client_phone)
+    set_if_value(db_call, "client_name", payload.client_name)
+
+    exported_at = parse_iso_datetime(payload.exported_at_utc)
+    if exported_at:
+        db_call.exported_at = exported_at
+
+    if not db_call.connected_at:
+        db_call.connected_at = exported_at or now
+
+    db_call.finished_at = now
+    db_call.updated_at = now
+    db_call.status = payload.finalization_reason or "finalized"
+
+    db_call.duration = safe_int(payload.call_duration_sec)
+    db_call.telephony_cost_rub = safe_float(payload.telephony_cost_rub)
+    db_call.websocket_duration_sec = safe_float(payload.websocket_duration_sec)
+    db_call.websocket_cost_rub = safe_float(payload.websocket_cost_rub)
+    db_call.voximplant_total_rub = safe_float(payload.voximplant_total_rub)
+    db_call.ai_cost_usd = safe_float(payload.ai_cost_usd)
+    db_call.ai_cost_rub = safe_float(payload.ai_cost_rub)
+    db_call.total_cost_rub = safe_float(payload.total_cost_rub)
+
+    set_if_value(db_call, "summary", payload.summary)
+    set_if_value(db_call, "call_goal", payload.call_goal)
+    set_if_value(db_call, "manager_offer", payload.manager_offer)
+    set_if_value(db_call, "outcome", payload.outcome)
+    set_if_value(db_call, "next_step", payload.next_step)
+    set_if_value(db_call, "dialogue_text", payload.dialogue_text)
+
+    set_if_value(db_call, "recording_status", payload.recording_status)
+    set_if_value(db_call, "recording_url", payload.recording_url)
+    set_if_value(db_call, "recording_error", payload.recording_error)
+
+    db_call.usage_json = to_json_text(payload.usage)
+    db_call.summary_fields_json = to_json_text(payload.summary_fields)
+    db_call.dialogue_items_json = to_json_text(payload.dialogue_items)
+    db_call.admin_report_html = payload.admin_report_html or render_admin_report(payload)
+    db_call.summary_report_html = payload.summary_report_html or render_summary_report(payload)
+    db_call.raw_payload_json = to_json_text(payload.model_dump(mode="json"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Crystal Stone backend starting")
+    scheduler.add_job(cleanup_old_recordings, "interval", hours=CLEANUP_INTERVAL_HOURS)
+    scheduler.start()
+    yield
+    logger.info("Crystal Stone backend stopping")
+    scheduler.shutdown()
+    if bot is not None:
+        await bot.session.close()
+
+
+app = FastAPI(title="Crystal Stone Backend", lifespan=lifespan)
+
+
+@app.get("/")
+def read_root():
+    return {"service": "crystal_stone_backend", "status": "ok", "time_utc": datetime.utcnow().isoformat()}
+
+
+@app.get("/healthz")
+def healthcheck():
+    return {"ok": True, "time_utc": datetime.utcnow().isoformat()}
+
+
+@app.get("/calls")
+def list_calls(
+    secret: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    if not BACKEND_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="admin api disabled")
+    if secret != BACKEND_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="invalid secret")
+
+    calls = db.query(Call).order_by(Call.started_at.desc()).limit(limit).all()
+    return [call.as_dict() for call in calls]
+
+
+@app.post("/webhook/voximplant/call_started")
+async def call_started(
+    payload: CallStartedPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    require_webhook_secret(request)
+
+    db_call = get_or_create_call(db, payload.session_id)
+    set_if_value(db_call, "project", payload.project)
+    set_if_value(db_call, "script_name", payload.script_name)
+    set_if_value(db_call, "caller_phone", payload.caller_phone)
+
+    connected_at = parse_iso_datetime(payload.connected_at_utc)
+    if connected_at:
+        db_call.connected_at = connected_at
+    if not db_call.started_at:
+        db_call.started_at = datetime.utcnow()
+    db_call.updated_at = datetime.utcnow()
+    db_call.status = db_call.status or "started"
+    db.commit()
+
+    return {"status": "success", "session_id": payload.session_id}
+
+
+@app.post("/webhook/voximplant/call_finished")
+async def call_finished(
+    payload: CallFinishedPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    require_webhook_secret(request)
+
+    db_call = get_or_create_call(db, payload.session_id)
+    if payload.duration is not None:
+        db_call.duration = safe_int(payload.duration)
+    set_if_value(db_call, "summary", payload.summary)
+    db_call.finished_at = parse_iso_datetime(payload.finished_at_utc) or datetime.utcnow()
+    db_call.updated_at = datetime.utcnow()
+    db_call.status = payload.status or "finished"
+    db.commit()
+
+    return {"status": "success", "session_id": payload.session_id}
+
+
+@app.post("/webhook/voximplant/recording_ready")
+async def recording_ready(
+    payload: RecordingReadyPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    require_webhook_secret(request)
+
+    db_call = get_or_create_call(db, payload.session_id)
+    set_if_value(db_call, "project", payload.project)
+    set_if_value(db_call, "script_name", payload.script_name)
+    db_call.recording_url = payload.recording_url
+    db_call.recording_status = payload.recording_status or "ready"
+    set_if_value(db_call, "recording_error", payload.recording_error)
+    db_call.updated_at = datetime.utcnow()
+    db.commit()
+
+    asyncio.create_task(persist_recording_download(payload.session_id, payload.recording_url))
+    return {"status": "success", "session_id": payload.session_id}
+
+
+@app.post("/webhook/voximplant/report")
+async def legacy_report(
+    payload: CallReportPayload,
+    request: Request,
+):
+    require_webhook_secret(request)
+
+    if payload.report_type == "ADMIN_REPORT":
+        status, error_text = await send_telegram_text(get_admin_chat_ids(), payload.text)
+    elif payload.report_type == "SUMMARY_REPORT":
+        status, error_text = await send_telegram_text(get_summary_chat_ids(), payload.text)
+    else:
+        raise HTTPException(status_code=400, detail="unknown report_type")
+
+    return {"status": status, "error": error_text}
+
+
+@app.post("/webhook/voximplant/google_sheets")
+async def legacy_google_sheets(
+    request: Request,
+):
+    require_webhook_secret(request)
+    payload = await request.json()
+    status, response_text = await send_to_google_sheets(payload)
+    return {"status": status, "response": response_text}
+
+
+@app.post("/webhook/voximplant/finalize")
+async def finalize_call(
+    payload: FinalizePayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    require_webhook_secret(request)
+
+    db_call = get_or_create_call(db, payload.session_id)
+    fill_call_from_finalize(db_call, payload)
+    db.commit()
+
+    if payload.recording_url:
+        asyncio.create_task(persist_recording_download(payload.session_id, payload.recording_url))
+
+    admin_status, admin_error = await send_telegram_text(
+        get_admin_chat_ids(),
+        db_call.admin_report_html or render_admin_report(payload),
+    )
+    summary_status, summary_error = await send_telegram_text(
+        get_summary_chat_ids(),
+        db_call.summary_report_html or render_summary_report(payload),
+    )
+
+    sheets_payload = payload.model_dump(mode="json")
+    sheets_status, sheets_response = await send_to_google_sheets(sheets_payload)
+
+    db_call.telegram_admin_status = admin_status
+    db_call.telegram_summary_status = summary_status
+    db_call.google_sheets_status = sheets_status
+    db_call.google_sheets_response = sheets_response
+
+    error_parts = [part for part in [admin_error, summary_error] if part]
+    if sheets_status == "error" and sheets_response:
+        error_parts.append(sheets_response)
+    db_call.last_error = " | ".join(error_parts) if error_parts else None
+    db_call.updated_at = datetime.utcnow()
+    db.commit()
+
+    return {
+        "status": "success",
+        "session_id": payload.session_id,
+        "telegram_admin_status": admin_status,
+        "telegram_summary_status": summary_status,
+        "google_sheets_status": sheets_status,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

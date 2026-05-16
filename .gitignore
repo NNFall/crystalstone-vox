@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local env and runtime
+backend/.env
+backend/venv/
+backend/voximplant.db
+backend/backend.log
+backend/recordings/
+
+# Local backups and archives
+backups/
+archive/
+*.bak
+*.bak_*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

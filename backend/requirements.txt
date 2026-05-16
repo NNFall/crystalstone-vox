@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+aiogram
+pydantic
+python-dotenv
+sqlalchemy
+apscheduler
+aiohttp
+
