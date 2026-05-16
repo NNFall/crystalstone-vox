@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -242,47 +243,68 @@ def set_if_value(obj: Any, field_name: str, value: Any):
     setattr(obj, field_name, value)
 
 
+QUESTION_MARKS_RE = re.compile(r"^[\s?]+$")
+
+
+def display_or_default(value: Any, default: str = "\u043d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d\u043e") -> str:
+    text = safe_text(value).strip()
+    if not text:
+        return default
+    if QUESTION_MARKS_RE.fullmatch(text):
+        return default
+    return text
+
+
+def is_diagnostic_finalize(payload: "FinalizePayload") -> bool:
+    session_id = safe_text(payload.session_id).strip().lower()
+    script_name = safe_text(payload.script_name).strip().lower()
+    return session_id.startswith("manual-test-") or script_name in {"manual", "test", "debug"}
+
+
+DEFAULT_NOT_SPECIFIED = "\u043d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d\u043e"
+DEFAULT_UNKNOWN = "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"
+DEFAULT_NO_DIALOGUE = "\u0420\u0435\u043f\u043b\u0438\u043a\u0438 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u044b."
+
 def render_admin_report(payload: FinalizePayload) -> str:
+    usage_text = safe_text(payload.usage).strip() or "{}"
     lines = [
-        "<b>Звонок завершен</b>",
-        f"<b>Номер:</b> {safe_text(payload.client_phone or payload.caller_phone or 'неизвестно')}",
-        f"<b>Длительность:</b> {safe_text(payload.call_duration_sec or 0)} сек",
-        f"<b>Телефония:</b> {safe_text(payload.voximplant_total_rub or payload.telephony_cost_rub or 0)} руб",
-        f"<b>AI:</b> {safe_text(payload.ai_cost_rub or 0)} руб ({safe_text(payload.ai_cost_usd or 0)} USD)",
-        f"<b>Итоговая стоимость:</b> {safe_text(payload.total_cost_rub or payload.voximplant_total_rub or payload.telephony_cost_rub or 0)} руб",
+        "<b>\u0417\u0432\u043e\u043d\u043e\u043a \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d</b>",
+        f"<b>\u041d\u043e\u043c\u0435\u0440:</b> {display_or_default(payload.client_phone or payload.caller_phone or DEFAULT_UNKNOWN, DEFAULT_UNKNOWN)}",
+        f"<b>\u0414\u043b\u0438\u0442\u0435\u043b\u044c\u043d\u043e\u0441\u0442\u044c:</b> {safe_text(payload.call_duration_sec or 0)} \u0441\u0435\u043a",
+        f"<b>\u0422\u0435\u043b\u0435\u0444\u043e\u043d\u0438\u044f:</b> {safe_text(payload.voximplant_total_rub or payload.telephony_cost_rub or 0)} \u0440\u0443\u0431",
+        f"<b>AI:</b> {safe_text(payload.ai_cost_rub or 0)} \u0440\u0443\u0431 ({safe_text(payload.ai_cost_usd or 0)} USD)",
+        f"<b>\u0418\u0442\u043e\u0433\u043e\u0432\u0430\u044f \u0441\u0442\u043e\u0438\u043c\u043e\u0441\u0442\u044c:</b> {safe_text(payload.total_cost_rub or payload.voximplant_total_rub or payload.telephony_cost_rub or 0)} \u0440\u0443\u0431",
     ]
 
     if payload.recording_url:
-        lines.append(f"<b>Запись:</b> {payload.recording_url}")
+        lines.append(f"<b>\u0417\u0430\u043f\u0438\u0441\u044c:</b> {payload.recording_url}")
 
     lines.extend(
         [
             "",
-            "<b>Токены:</b>",
-            safe_text(payload.usage),
+            "<b>\u0422\u043e\u043a\u0435\u043d\u044b:</b>",
+            usage_text,
             "",
-            "<b>Диалог:</b>",
-            safe_text(payload.dialogue_text or "Реплики не найдены."),
+            "<b>\u0414\u0438\u0430\u043b\u043e\u0433:</b>",
+            display_or_default(payload.dialogue_text or DEFAULT_NO_DIALOGUE, DEFAULT_NO_DIALOGUE),
         ]
     )
     return "\n".join(lines)
 
-
 def render_summary_report(payload: FinalizePayload) -> str:
     lines = [
-        "<b>Новый звонок (суммаризация)</b>",
-        f"<b>Номер:</b> {safe_text(payload.client_phone or payload.caller_phone or 'неизвестно')}",
-        f"<b>Имя:</b> {safe_text(payload.client_name or 'не указано')}",
-        f"<b>Запрос:</b> {safe_text(payload.call_goal or 'не указано')}",
-        f"<b>Что предложили:</b> {safe_text(payload.manager_offer or 'не указано')}",
-        f"<b>Итог:</b> {safe_text(payload.outcome or 'не указано')}",
-        f"<b>Следующий шаг:</b> {safe_text(payload.next_step or 'не указано')}",
+        "<b>\u041d\u043e\u0432\u044b\u0439 \u0437\u0432\u043e\u043d\u043e\u043a (\u0441\u0443\u043c\u043c\u0430\u0440\u0438\u0437\u0430\u0446\u0438\u044f)</b>",
+        f"<b>\u041d\u043e\u043c\u0435\u0440:</b> {display_or_default(payload.client_phone or payload.caller_phone or DEFAULT_UNKNOWN, DEFAULT_UNKNOWN)}",
+        f"<b>\u0418\u043c\u044f:</b> {display_or_default(payload.client_name, DEFAULT_NOT_SPECIFIED)}",
+        f"<b>\u0417\u0430\u043f\u0440\u043e\u0441:</b> {display_or_default(payload.call_goal, DEFAULT_NOT_SPECIFIED)}",
+        f"<b>\u0427\u0442\u043e \u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0438\u043b\u0438:</b> {display_or_default(payload.manager_offer, DEFAULT_NOT_SPECIFIED)}",
+        f"<b>\u0418\u0442\u043e\u0433:</b> {display_or_default(payload.outcome, DEFAULT_NOT_SPECIFIED)}",
+        f"<b>\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 \u0448\u0430\u0433:</b> {display_or_default(payload.next_step, DEFAULT_NOT_SPECIFIED)}",
     ]
     if payload.recording_url:
-        lines.append(f"<b>Запись:</b> {payload.recording_url}")
-    lines.extend(["", f"<b>Кратко:</b> {safe_text(payload.summary or 'не указано')}"])
+        lines.append(f"<b>\u0417\u0430\u043f\u0438\u0441\u044c:</b> {payload.recording_url}")
+    lines.extend(["", f"<b>\u041a\u0440\u0430\u0442\u043a\u043e:</b> {display_or_default(payload.summary, DEFAULT_NOT_SPECIFIED)}"])
     return "\n".join(lines)
-
 
 async def send_telegram_text(chat_ids: list[str], html_text: str) -> tuple[str, Optional[str]]:
     if not chat_ids:
@@ -664,14 +686,18 @@ async def finalize_call(
     if payload.recording_url:
         asyncio.create_task(persist_recording_download(payload.session_id, payload.recording_url))
 
-    admin_status, admin_error = await send_telegram_text(
-        get_admin_chat_ids(),
-        db_call.admin_report_html or render_admin_report(payload),
-    )
-    summary_status, summary_error = await send_telegram_text(
-        get_summary_chat_ids(),
-        db_call.summary_report_html or render_summary_report(payload),
-    )
+    if is_diagnostic_finalize(payload):
+        admin_status, admin_error = "skipped_diagnostic", None
+        summary_status, summary_error = "skipped_diagnostic", None
+    else:
+        admin_status, admin_error = await send_telegram_text(
+            get_admin_chat_ids(),
+            db_call.admin_report_html or render_admin_report(payload),
+        )
+        summary_status, summary_error = await send_telegram_text(
+            get_summary_chat_ids(),
+            db_call.summary_report_html or render_summary_report(payload),
+        )
 
     sheets_payload = payload.model_dump(mode="json")
     sheets_status, sheets_response = await send_to_google_sheets(sheets_payload)
