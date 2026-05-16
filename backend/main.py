@@ -15,7 +15,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -42,6 +42,10 @@ TELEGRAM_USER_CHAT_IDS_STR = os.getenv("TELEGRAM_USER_CHAT_IDS", "")
 GOOGLE_APPS_SCRIPT_WEBHOOK_URL = os.getenv("GOOGLE_APPS_SCRIPT_WEBHOOK_URL", "").strip()
 RECORDINGS_TTL_DAYS = int(os.getenv("RECORDINGS_TTL_DAYS", "30"))
 CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
+DELIVERY_RETRY_ATTEMPTS = max(1, int(os.getenv("DELIVERY_RETRY_ATTEMPTS", "3")))
+DELIVERY_RETRY_DELAY_MS = max(100, int(os.getenv("DELIVERY_RETRY_DELAY_MS", "700")))
+DOWNLOAD_RETRY_ATTEMPTS = max(1, int(os.getenv("DOWNLOAD_RETRY_ATTEMPTS", "3")))
+DOWNLOAD_RETRY_DELAY_MS = max(100, int(os.getenv("DOWNLOAD_RETRY_DELAY_MS", "1200")))
 
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -191,6 +195,14 @@ def dedupe(items: list[str]) -> list[str]:
     return result
 
 
+def backoff_seconds(base_delay_ms: int, attempt: int) -> float:
+    return (base_delay_ms * attempt) / 1000.0
+
+
+async def wait_before_retry(base_delay_ms: int, attempt: int):
+    await asyncio.sleep(backoff_seconds(base_delay_ms, attempt))
+
+
 def get_admin_chat_ids() -> list[str]:
     return normalize_chat_ids(TELEGRAM_ADMIN_CHAT_ID)
 
@@ -282,11 +294,26 @@ async def send_telegram_text(chat_ids: list[str], html_text: str) -> tuple[str, 
 
     errors: list[str] = []
     for chat_id in chat_ids:
-        try:
-            await bot.send_message(chat_id=chat_id, text=html_text, disable_web_page_preview=True)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{chat_id}: {exc}")
-            logger.exception("Failed to send Telegram message to %s", chat_id)
+        sent = False
+        last_error_text = ""
+        for attempt in range(1, DELIVERY_RETRY_ATTEMPTS + 1):
+            try:
+                await bot.send_message(chat_id=chat_id, text=html_text, disable_web_page_preview=True)
+                sent = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error_text = str(exc)
+                logger.warning(
+                    "Telegram send failed for chat=%s attempt=%s/%s: %s",
+                    chat_id,
+                    attempt,
+                    DELIVERY_RETRY_ATTEMPTS,
+                    last_error_text,
+                )
+                if attempt < DELIVERY_RETRY_ATTEMPTS:
+                    await wait_before_retry(DELIVERY_RETRY_DELAY_MS, attempt)
+        if not sent:
+            errors.append(f"{chat_id}: {last_error_text or 'unknown_error'}")
 
     if errors and len(errors) == len(chat_ids):
         return "error", "; ".join(errors)
@@ -299,16 +326,36 @@ async def send_to_google_sheets(payload: dict[str, Any]) -> tuple[str, Optional[
     if not GOOGLE_APPS_SCRIPT_WEBHOOK_URL:
         return "skipped_no_url", None
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(GOOGLE_APPS_SCRIPT_WEBHOOK_URL, json=payload) as response:
-                response_text = await response.text()
-                if response.status >= 400:
-                    return "error", f"HTTP {response.status}: {response_text[:1000]}"
-                return "sent", response_text[:4000]
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to sync payload with Google Sheets")
-        return "error", str(exc)
+    last_error = ""
+    for attempt in range(1, DELIVERY_RETRY_ATTEMPTS + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=25)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(GOOGLE_APPS_SCRIPT_WEBHOOK_URL, json=payload) as response:
+                    response_text = await response.text()
+                    if response.status >= 400:
+                        last_error = f"HTTP {response.status}: {response_text[:1000]}"
+                        logger.warning(
+                            "Google Sheets sync failed attempt=%s/%s: %s",
+                            attempt,
+                            DELIVERY_RETRY_ATTEMPTS,
+                            last_error,
+                        )
+                    else:
+                        return "sent", response_text[:4000]
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            logger.warning(
+                "Google Sheets sync network error attempt=%s/%s: %s",
+                attempt,
+                DELIVERY_RETRY_ATTEMPTS,
+                last_error,
+            )
+
+        if attempt < DELIVERY_RETRY_ATTEMPTS:
+            await wait_before_retry(DELIVERY_RETRY_DELAY_MS, attempt)
+
+    return "error", last_error or "sync_failed"
 
 
 def guess_recording_extension(url: str) -> str:
@@ -323,17 +370,35 @@ async def download_recording(url: str, session_id: str) -> tuple[str, Optional[s
     extension = guess_recording_extension(url)
     file_path = RECORDINGS_DIR / f"{session_id}{extension}"
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status >= 400:
-                    return "download_error", None, f"HTTP {response.status}"
-                file_path.write_bytes(await response.read())
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to download recording for %s", session_id)
-        return "download_error", None, str(exc)
+    last_error = ""
+    for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status >= 400:
+                        last_error = f"HTTP {response.status}"
+                    else:
+                        data = await response.read()
+                        if not data:
+                            last_error = "empty_recording_file"
+                        else:
+                            file_path.write_bytes(data)
+                            return "downloaded", str(file_path), None
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            logger.warning(
+                "Recording download failed session=%s attempt=%s/%s: %s",
+                session_id,
+                attempt,
+                DOWNLOAD_RETRY_ATTEMPTS,
+                last_error,
+            )
 
-    return "downloaded", str(file_path), None
+        if attempt < DOWNLOAD_RETRY_ATTEMPTS:
+            await wait_before_retry(DOWNLOAD_RETRY_DELAY_MS, attempt)
+
+    return "download_error", None, last_error or "download_failed"
 
 
 async def persist_recording_download(session_id: str, url: str):
@@ -472,6 +537,23 @@ def list_calls(
 
     calls = db.query(Call).order_by(Call.started_at.desc()).limit(limit).all()
     return [call.as_dict() for call in calls]
+
+
+@app.get("/calls/{session_id}")
+def get_call(
+    session_id: str = ApiPath(..., min_length=3),
+    secret: str = Query(default=""),
+    db: Session = Depends(get_db),
+):
+    if not BACKEND_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="admin api disabled")
+    if secret != BACKEND_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="invalid secret")
+
+    db_call = db.query(Call).filter(Call.voximplant_session_id == session_id).first()
+    if not db_call:
+        raise HTTPException(status_code=404, detail="call not found")
+    return db_call.as_dict()
 
 
 @app.post("/webhook/voximplant/call_started")
