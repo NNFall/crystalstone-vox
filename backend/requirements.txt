@@ -6,4 +6,5 @@ python-dotenv
 sqlalchemy
 apscheduler
 aiohttp
+voximplant-apiclient
 

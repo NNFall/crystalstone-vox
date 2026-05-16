@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from database import Call, SessionLocal
+from voximplant.apiclient import VoximplantAPI
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_PATH = BASE_DIR / "backend.log"
@@ -47,6 +48,7 @@ DELIVERY_RETRY_ATTEMPTS = max(1, int(os.getenv("DELIVERY_RETRY_ATTEMPTS", "3")))
 DELIVERY_RETRY_DELAY_MS = max(100, int(os.getenv("DELIVERY_RETRY_DELAY_MS", "700")))
 DOWNLOAD_RETRY_ATTEMPTS = max(1, int(os.getenv("DOWNLOAD_RETRY_ATTEMPTS", "3")))
 DOWNLOAD_RETRY_DELAY_MS = max(100, int(os.getenv("DOWNLOAD_RETRY_DELAY_MS", "1200")))
+VOXIMPLANT_CREDENTIALS_FILE_PATH = os.getenv("VOXIMPLANT_CREDENTIALS_FILE_PATH", "").strip()
 
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -60,6 +62,14 @@ else:
     logger.warning("TELEGRAM_BOT_TOKEN is not configured. Telegram delivery is disabled.")
 
 scheduler = AsyncIOScheduler()
+voximplant_api_client: Optional[VoximplantAPI] = None
+
+if VOXIMPLANT_CREDENTIALS_FILE_PATH:
+    try:
+        voximplant_api_client = VoximplantAPI(VOXIMPLANT_CREDENTIALS_FILE_PATH)
+        logger.info("Voximplant credentials loaded from %s", VOXIMPLANT_CREDENTIALS_FILE_PATH)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to initialize VoximplantAPI from credentials file")
 
 
 class CallStartedPayload(BaseModel):
@@ -391,13 +401,24 @@ def guess_recording_extension(url: str) -> str:
 async def download_recording(url: str, session_id: str) -> tuple[str, Optional[str], Optional[str]]:
     extension = guess_recording_extension(url)
     file_path = RECORDINGS_DIR / f"{session_id}{extension}"
+    auth_headers: dict[str, str] = {}
+
+    if voximplant_api_client and "voximplant-records-secure" in safe_text(url):
+        try:
+            auth_headers["Authorization"] = voximplant_api_client.build_auth_header()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to build authorization header for recording download session=%s: %s",
+                session_id,
+                str(exc),
+            )
 
     last_error = ""
     for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
         try:
             timeout = aiohttp.ClientTimeout(total=60)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
+                async with session.get(url, headers=auth_headers) as response:
                     if response.status >= 400:
                         last_error = f"HTTP {response.status}"
                     else:

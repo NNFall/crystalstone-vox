@@ -11,6 +11,7 @@ backend/venv/
 backend/voximplant.db
 backend/backend.log
 backend/recordings/
+backend/keys/
 
 # Local backups and archives
 backups/
