@@ -12,6 +12,7 @@
   - отправка данных в Google Apps Script / Google Sheets;
   - сохранение истории звонка в SQLite;
   - скачивание записи разговора на сервер;
+  - отправка записи звонка в Telegram отдельным аудиофайлом ответом на сообщение со сводкой;
   - очистка старых записей по TTL.
 
 ## Ключевые файлы
@@ -47,7 +48,9 @@ curl http://127.0.0.1:8000/healthz
 2. Backend сохраняет ссылку в БД.
 3. Backend пытается скачать файл в `backend/recordings/`.
 4. Если secure storage включен, используется service account JSON (`VOXIMPLANT_CREDENTIALS_FILE_PATH`).
-5. Планировщик удаляет старые записи по `RECORDINGS_TTL_DAYS`.
+5. В Telegram-сводку ссылка на запись не добавляется.
+6. После сводки backend отправляет локальный mp3-файл ответом на это же Telegram-сообщение.
+7. Планировщик удаляет старые записи по `RECORDINGS_TTL_DAYS`.
 
 Подробно: [backend/README.md](./backend/README.md) и [docs/voximplant_secure_recordings.md](./docs/voximplant_secure_recordings.md)
 

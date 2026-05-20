@@ -7,6 +7,7 @@ FastAPI backend, который принимает события от Voximplan
 - принимает lifecycle-события звонка;
 - хранит данные звонков в SQLite;
 - формирует и отправляет отчеты в Telegram;
+- отправляет запись звонка отдельным аудиофайлом в Telegram ответом на сообщение со сводкой;
 - отправляет payload в Google Apps Script (Google Sheets);
 - скачивает аудиозапись звонка локально на сервер;
 - очищает старые записи по TTL.
@@ -70,6 +71,8 @@ FastAPI backend, который принимает события от Voximplan
 3. Если URL из `voximplant-records-secure` и задан `VOXIMPLANT_CREDENTIALS_FILE_PATH`:
    - backend создает `Authorization: Bearer ...` через `voximplant-apiclient`;
    - скачивает запись уже авторизованно.
+4. После отправки Telegram-сводки backend отправляет локальный mp3-файл ответом на это же сообщение.
+5. Если ссылка на запись пришла позже финализации звонка, backend использует сохраненный `message_id` сводки и досылает запись отдельным reply-сообщением.
 
 ### Очистка
 

@@ -63,6 +63,9 @@ class Call(Base):
 
     telegram_admin_status = Column(String, nullable=True)
     telegram_summary_status = Column(String, nullable=True)
+    telegram_summary_message_ids_json = Column(Text, nullable=True)
+    telegram_recording_status = Column(String, nullable=True)
+    telegram_recording_error = Column(Text, nullable=True)
     google_sheets_status = Column(String, nullable=True)
     google_sheets_response = Column(Text, nullable=True)
     last_error = Column(Text, nullable=True)
@@ -104,6 +107,9 @@ class Call(Base):
             "recording_error": self.recording_error,
             "telegram_admin_status": self.telegram_admin_status,
             "telegram_summary_status": self.telegram_summary_status,
+            "telegram_summary_message_ids_json": self.telegram_summary_message_ids_json,
+            "telegram_recording_status": self.telegram_recording_status,
+            "telegram_recording_error": self.telegram_recording_error,
             "google_sheets_status": self.google_sheets_status,
             "google_sheets_response": self.google_sheets_response,
             "last_error": self.last_error,
@@ -142,6 +148,9 @@ SQLITE_CALLS_COLUMNS = {
     "raw_payload_json": "TEXT",
     "telegram_admin_status": "TEXT",
     "telegram_summary_status": "TEXT",
+    "telegram_summary_message_ids_json": "TEXT",
+    "telegram_recording_status": "TEXT",
+    "telegram_recording_error": "TEXT",
     "google_sheets_status": "TEXT",
     "google_sheets_response": "TEXT",
     "last_error": "TEXT",

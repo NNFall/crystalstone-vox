@@ -14,6 +14,7 @@ import aiohttp
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import FSInputFile, ReplyParameters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Query, Request
@@ -303,7 +304,7 @@ def render_admin_report(payload: FinalizePayload) -> str:
 
 def render_summary_report(payload: FinalizePayload) -> str:
     lines = [
-        "<b>\u041d\u043e\u0432\u044b\u0439 \u0437\u0432\u043e\u043d\u043e\u043a (\u0441\u0443\u043c\u043c\u0430\u0440\u0438\u0437\u0430\u0446\u0438\u044f)</b>",
+        "<b>\u041d\u043e\u0432\u044b\u0439 \u0437\u0432\u043e\u043d\u043e\u043a (\u0441\u0443\u043c\u043c\u0430\u0440\u0438\u0437\u0430\u0446\u0438\u044f) - Crystal Stone</b>",
         f"<b>\u041d\u043e\u043c\u0435\u0440:</b> {display_or_default(payload.client_phone or payload.caller_phone or DEFAULT_UNKNOWN, DEFAULT_UNKNOWN)}",
         f"<b>\u0418\u043c\u044f:</b> {display_or_default(payload.client_name, DEFAULT_NOT_SPECIFIED)}",
         f"<b>\u0417\u0430\u043f\u0440\u043e\u0441:</b> {display_or_default(payload.call_goal, DEFAULT_NOT_SPECIFIED)}",
@@ -311,26 +312,43 @@ def render_summary_report(payload: FinalizePayload) -> str:
         f"<b>\u0418\u0442\u043e\u0433:</b> {display_or_default(payload.outcome, DEFAULT_NOT_SPECIFIED)}",
         f"<b>\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 \u0448\u0430\u0433:</b> {display_or_default(payload.next_step, DEFAULT_NOT_SPECIFIED)}",
     ]
-    if payload.recording_url:
-        lines.append(f"<b>\u0417\u0430\u043f\u0438\u0441\u044c:</b> {payload.recording_url}")
     lines.extend(["", f"<b>\u041a\u0440\u0430\u0442\u043a\u043e:</b> {display_or_default(payload.summary, DEFAULT_NOT_SPECIFIED)}"])
     return "\n".join(lines)
 
-async def send_telegram_text(chat_ids: list[str], html_text: str) -> tuple[str, Optional[str]]:
+
+def normalize_summary_report_html(html_text: Optional[str], payload: FinalizePayload) -> str:
+    text = safe_text(html_text).strip()
+    if not text:
+        return render_summary_report(payload)
+
+    lines = []
+    for line in text.splitlines():
+        if line.strip().startswith("<b>\u0417\u0430\u043f\u0438\u0441\u044c:</b>"):
+            continue
+        lines.append(line)
+
+    if lines and "\u041d\u043e\u0432\u044b\u0439 \u0437\u0432\u043e\u043d\u043e\u043a (\u0441\u0443\u043c\u043c\u0430\u0440\u0438\u0437\u0430\u0446\u0438\u044f)" in lines[0] and "Crystal Stone" not in lines[0]:
+        lines[0] = "<b>\u041d\u043e\u0432\u044b\u0439 \u0437\u0432\u043e\u043d\u043e\u043a (\u0441\u0443\u043c\u043c\u0430\u0440\u0438\u0437\u0430\u0446\u0438\u044f) - Crystal Stone</b>"
+
+    return "\n".join(lines)
+
+async def send_telegram_text_with_ids(chat_ids: list[str], html_text: str) -> tuple[str, Optional[str], dict[str, int]]:
     if not chat_ids:
-        return "no_recipients", None
+        return "no_recipients", None, {}
     if not html_text:
-        return "empty_message", None
+        return "empty_message", None, {}
     if bot is None:
-        return "skipped_no_bot", None
+        return "skipped_no_bot", None, {}
 
     errors: list[str] = []
+    message_ids: dict[str, int] = {}
     for chat_id in chat_ids:
         sent = False
         last_error_text = ""
         for attempt in range(1, DELIVERY_RETRY_ATTEMPTS + 1):
             try:
-                await bot.send_message(chat_id=chat_id, text=html_text, disable_web_page_preview=True)
+                message = await bot.send_message(chat_id=chat_id, text=html_text, disable_web_page_preview=True)
+                message_ids[str(chat_id)] = int(message.message_id)
                 sent = True
                 break
             except Exception as exc:  # noqa: BLE001
@@ -348,6 +366,79 @@ async def send_telegram_text(chat_ids: list[str], html_text: str) -> tuple[str, 
             errors.append(f"{chat_id}: {last_error_text or 'unknown_error'}")
 
     if errors and len(errors) == len(chat_ids):
+        return "error", "; ".join(errors), message_ids
+    if errors:
+        return "partial", "; ".join(errors), message_ids
+    return "sent", None, message_ids
+
+
+async def send_telegram_text(chat_ids: list[str], html_text: str) -> tuple[str, Optional[str]]:
+    status, error_text, _message_ids = await send_telegram_text_with_ids(chat_ids, html_text)
+    return status, error_text
+
+
+def parse_telegram_message_ids(raw_value: Any) -> dict[str, int]:
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(safe_text(raw_value))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    result: dict[str, int] = {}
+    for chat_id, message_id in parsed.items():
+        message_number = safe_int(message_id)
+        if chat_id and message_number:
+            result[str(chat_id)] = message_number
+    return result
+
+
+async def send_telegram_recording_replies(
+    chat_message_ids: dict[str, int],
+    local_recording_path: Optional[str],
+) -> tuple[str, Optional[str]]:
+    if not chat_message_ids:
+        return "no_summary_messages", None
+    if bot is None:
+        return "skipped_no_bot", None
+    if not local_recording_path:
+        return "no_local_recording", None
+
+    file_path = Path(local_recording_path)
+    if not file_path.is_file():
+        return "recording_file_missing", str(file_path)
+
+    errors: list[str] = []
+    for chat_id, message_id in chat_message_ids.items():
+        sent = False
+        last_error_text = ""
+        for attempt in range(1, DELIVERY_RETRY_ATTEMPTS + 1):
+            try:
+                await bot.send_audio(
+                    chat_id=chat_id,
+                    audio=FSInputFile(str(file_path)),
+                    caption="\u0417\u0430\u043f\u0438\u0441\u044c \u0437\u0432\u043e\u043d\u043a\u0430",
+                    reply_parameters=ReplyParameters(message_id=message_id),
+                )
+                sent = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error_text = str(exc)
+                logger.warning(
+                    "Telegram recording send failed for chat=%s attempt=%s/%s: %s",
+                    chat_id,
+                    attempt,
+                    DELIVERY_RETRY_ATTEMPTS,
+                    last_error_text,
+                )
+                if attempt < DELIVERY_RETRY_ATTEMPTS:
+                    await wait_before_retry(DELIVERY_RETRY_DELAY_MS, attempt)
+        if not sent:
+            errors.append(f"{chat_id}: {last_error_text or 'unknown_error'}")
+
+    if errors and len(errors) == len(chat_message_ids):
         return "error", "; ".join(errors)
     if errors:
         return "partial", "; ".join(errors)
@@ -444,20 +535,32 @@ async def download_recording(url: str, session_id: str) -> tuple[str, Optional[s
     return "download_error", None, last_error or "download_failed"
 
 
+async def ensure_call_recording_downloaded(db_call: Call, url: Optional[str]) -> tuple[str, Optional[str], Optional[str]]:
+    if db_call.local_recording_path and Path(db_call.local_recording_path).is_file():
+        return "already_downloaded", db_call.local_recording_path, None
+
+    if not url:
+        return "no_recording_url", None, None
+
+    status, local_path, error_text = await download_recording(url, db_call.voximplant_session_id)
+    if local_path:
+        db_call.local_recording_path = local_path
+    if status:
+        db_call.recording_status = status
+    if error_text:
+        db_call.recording_error = error_text
+        db_call.last_error = error_text
+    db_call.updated_at = datetime.utcnow()
+    return status, local_path, error_text
+
+
 async def persist_recording_download(session_id: str, url: str):
-    status, local_path, error_text = await download_recording(url, session_id)
     db = SessionLocal()
     try:
         db_call = db.query(Call).filter(Call.voximplant_session_id == session_id).first()
         if not db_call:
             return
-        if local_path:
-            db_call.local_recording_path = local_path
-        if error_text:
-            db_call.last_error = error_text
-        if db_call.recording_status in (None, "", "not_started", "requested_not_confirmed"):
-            db_call.recording_status = status
-        db_call.updated_at = datetime.utcnow()
+        await ensure_call_recording_downloaded(db_call, url)
         db.commit()
     finally:
         db.close()
@@ -538,7 +641,7 @@ def fill_call_from_finalize(db_call: Call, payload: FinalizePayload):
     db_call.summary_fields_json = to_json_text(payload.summary_fields)
     db_call.dialogue_items_json = to_json_text(payload.dialogue_items)
     db_call.admin_report_html = payload.admin_report_html or render_admin_report(payload)
-    db_call.summary_report_html = payload.summary_report_html or render_summary_report(payload)
+    db_call.summary_report_html = normalize_summary_report_html(payload.summary_report_html, payload)
     db_call.raw_payload_json = to_json_text(payload.model_dump(mode="json"))
 
 
@@ -661,7 +764,18 @@ async def recording_ready(
     db_call.updated_at = datetime.utcnow()
     db.commit()
 
-    asyncio.create_task(persist_recording_download(payload.session_id, payload.recording_url))
+    await ensure_call_recording_downloaded(db_call, payload.recording_url)
+
+    message_ids = parse_telegram_message_ids(db_call.telegram_summary_message_ids_json)
+    if message_ids and db_call.telegram_recording_status not in {"sent", "partial"}:
+        recording_status, recording_error = await send_telegram_recording_replies(
+            message_ids,
+            db_call.local_recording_path,
+        )
+        db_call.telegram_recording_status = recording_status
+        db_call.telegram_recording_error = recording_error
+
+    db.commit()
     return {"status": "success", "session_id": payload.session_id}
 
 
@@ -704,20 +818,32 @@ async def finalize_call(
     fill_call_from_finalize(db_call, payload)
     db.commit()
 
-    if payload.recording_url:
-        asyncio.create_task(persist_recording_download(payload.session_id, payload.recording_url))
+    recording_source_url = payload.recording_url or db_call.recording_url
+    if recording_source_url:
+        await ensure_call_recording_downloaded(db_call, recording_source_url)
+        db.commit()
 
+    summary_message_ids: dict[str, int] = {}
+    recording_status, recording_error = "skipped_no_summary", None
     if is_diagnostic_finalize(payload):
         admin_status, admin_error = "skipped_diagnostic", None
         summary_status, summary_error = "skipped_diagnostic", None
+        recording_status, recording_error = "skipped_diagnostic", None
     else:
         admin_status, admin_error = await send_telegram_text(
             get_admin_chat_ids(),
             db_call.admin_report_html or render_admin_report(payload),
         )
-        summary_status, summary_error = await send_telegram_text(
+        summary_status, summary_error, summary_message_ids = await send_telegram_text_with_ids(
             get_summary_chat_ids(),
-            db_call.summary_report_html or render_summary_report(payload),
+            normalize_summary_report_html(db_call.summary_report_html, payload),
+        )
+        if summary_message_ids:
+            db_call.telegram_summary_message_ids_json = json.dumps(summary_message_ids, ensure_ascii=False)
+
+        recording_status, recording_error = await send_telegram_recording_replies(
+            summary_message_ids,
+            db_call.local_recording_path,
         )
 
     sheets_payload = payload.model_dump(mode="json")
@@ -725,10 +851,12 @@ async def finalize_call(
 
     db_call.telegram_admin_status = admin_status
     db_call.telegram_summary_status = summary_status
+    db_call.telegram_recording_status = recording_status
+    db_call.telegram_recording_error = recording_error
     db_call.google_sheets_status = sheets_status
     db_call.google_sheets_response = sheets_response
 
-    error_parts = [part for part in [admin_error, summary_error] if part]
+    error_parts = [part for part in [admin_error, summary_error, recording_error] if part]
     if sheets_status == "error" and sheets_response:
         error_parts.append(sheets_response)
     db_call.last_error = " | ".join(error_parts) if error_parts else None
@@ -740,6 +868,7 @@ async def finalize_call(
         "session_id": payload.session_id,
         "telegram_admin_status": admin_status,
         "telegram_summary_status": summary_status,
+        "telegram_recording_status": recording_status,
         "google_sheets_status": sheets_status,
     }
 
