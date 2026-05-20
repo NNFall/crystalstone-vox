@@ -22,6 +22,11 @@
   - `Bot.send_audio` supports `reply_parameters`
   - secure Voximplant recording download works with the configured service account.
 
+### Follow-up
+- Last test call showed `recording_error = HTTP 401` when backend tried to download the secure recording immediately after Voximplant sent the URL.
+- Manual retry a few minutes later downloaded the same file successfully.
+- Added delayed recording retries (`20,60,180` seconds by default) so backend can download the mp3 after Voximplant storage finishes preparing it and then send it as a Telegram reply.
+
 ## 2026-05-16
 
 ### Scope

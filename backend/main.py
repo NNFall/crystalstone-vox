@@ -51,6 +51,28 @@ DOWNLOAD_RETRY_ATTEMPTS = max(1, int(os.getenv("DOWNLOAD_RETRY_ATTEMPTS", "3")))
 DOWNLOAD_RETRY_DELAY_MS = max(100, int(os.getenv("DOWNLOAD_RETRY_DELAY_MS", "1200")))
 VOXIMPLANT_CREDENTIALS_FILE_PATH = os.getenv("VOXIMPLANT_CREDENTIALS_FILE_PATH", "").strip()
 
+
+def parse_delay_list(raw_value: str, fallback: list[int]) -> list[int]:
+    delays: list[int] = []
+    normalized = "" if raw_value is None else str(raw_value)
+    for item in normalized.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            delay = int(float(item))
+        except ValueError:
+            continue
+        if delay > 0:
+            delays.append(delay)
+    return delays or fallback
+
+
+RECORDING_DELAYED_RETRY_DELAYS_SEC = parse_delay_list(
+    os.getenv("RECORDING_DELAYED_RETRY_DELAYS_SEC", "20,60,180"),
+    [20, 60, 180],
+)
+
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 bot: Optional[Bot] = None
@@ -64,6 +86,7 @@ else:
 
 scheduler = AsyncIOScheduler()
 voximplant_api_client: Optional[VoximplantAPI] = None
+recording_retry_sessions: set[str] = set()
 
 if VOXIMPLANT_CREDENTIALS_FILE_PATH:
     try:
@@ -537,6 +560,8 @@ async def download_recording(url: str, session_id: str) -> tuple[str, Optional[s
 
 async def ensure_call_recording_downloaded(db_call: Call, url: Optional[str]) -> tuple[str, Optional[str], Optional[str]]:
     if db_call.local_recording_path and Path(db_call.local_recording_path).is_file():
+        db_call.recording_status = "downloaded"
+        db_call.recording_error = None
         return "already_downloaded", db_call.local_recording_path, None
 
     if not url:
@@ -545,6 +570,7 @@ async def ensure_call_recording_downloaded(db_call: Call, url: Optional[str]) ->
     status, local_path, error_text = await download_recording(url, db_call.voximplant_session_id)
     if local_path:
         db_call.local_recording_path = local_path
+        db_call.recording_error = None
     if status:
         db_call.recording_status = status
     if error_text:
@@ -564,6 +590,63 @@ async def persist_recording_download(session_id: str, url: str):
         db.commit()
     finally:
         db.close()
+
+
+def schedule_recording_retry(session_id: str, url: Optional[str], reason: str):
+    if not url:
+        return
+    if session_id in recording_retry_sessions:
+        logger.info("Recording retry already scheduled session=%s reason=%s", session_id, reason)
+        return
+
+    recording_retry_sessions.add(session_id)
+    logger.info("Scheduling delayed recording retry session=%s reason=%s", session_id, reason)
+    asyncio.create_task(retry_recording_download_and_send(session_id, url, reason))
+
+
+async def retry_recording_download_and_send(session_id: str, url: str, reason: str):
+    try:
+        for delay_sec in RECORDING_DELAYED_RETRY_DELAYS_SEC:
+            await asyncio.sleep(delay_sec)
+
+            db = SessionLocal()
+            try:
+                db_call = db.query(Call).filter(Call.voximplant_session_id == session_id).first()
+                if not db_call:
+                    logger.warning("Recording retry skipped, call not found session=%s", session_id)
+                    return
+
+                source_url = db_call.recording_url or url
+                status, local_path, error_text = await ensure_call_recording_downloaded(db_call, source_url)
+                logger.info(
+                    "Delayed recording retry session=%s reason=%s delay=%s status=%s error=%s",
+                    session_id,
+                    reason,
+                    delay_sec,
+                    status,
+                    error_text,
+                )
+
+                if local_path:
+                    message_ids = parse_telegram_message_ids(db_call.telegram_summary_message_ids_json)
+                    if message_ids and db_call.telegram_recording_status not in {"sent", "partial"}:
+                        recording_status, recording_error = await send_telegram_recording_replies(
+                            message_ids,
+                            local_path,
+                        )
+                        db_call.telegram_recording_status = recording_status
+                        db_call.telegram_recording_error = recording_error
+                    db_call.updated_at = datetime.utcnow()
+                    db.commit()
+                    return
+
+                db.commit()
+            finally:
+                db.close()
+
+        logger.warning("Delayed recording retry exhausted session=%s reason=%s", session_id, reason)
+    finally:
+        recording_retry_sessions.discard(session_id)
 
 
 async def cleanup_old_recordings():
@@ -775,6 +858,9 @@ async def recording_ready(
         db_call.telegram_recording_status = recording_status
         db_call.telegram_recording_error = recording_error
 
+    if not db_call.local_recording_path:
+        schedule_recording_retry(payload.session_id, payload.recording_url, "recording_ready_download_not_ready")
+
     db.commit()
     return {"status": "success", "session_id": payload.session_id}
 
@@ -845,6 +931,8 @@ async def finalize_call(
             summary_message_ids,
             db_call.local_recording_path,
         )
+        if recording_status in {"no_local_recording", "recording_file_missing"} and recording_source_url:
+            schedule_recording_retry(payload.session_id, recording_source_url, "finalize_recording_not_ready")
 
     sheets_payload = payload.model_dump(mode="json")
     sheets_status, sheets_response = await send_to_google_sheets(sheets_payload)
