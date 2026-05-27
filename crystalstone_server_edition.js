@@ -4,6 +4,8 @@ require(Modules.ApplicationStorage);
 const ANSWER_DELAY_MS = 3000;
 const RINGBACK_COUNTRY = 'RU';
 const SUMMARY_REQUEST_TIMEOUT_MS = 15000;
+const CLIENT_SILENCE_PROMPT_MS = 10000;
+const CLIENT_SILENCE_MAX_PROMPTS = 2;
 
 const SUMMARY_FUNCTION_NAME = 'save_call_summary';
 
@@ -25,6 +27,8 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
     let answerTimer = null;
     let summaryWaitTimer = null;
     let summaryWaitDone = null;
+    let clientSilenceTimer = null;
+    let clientSilencePromptCount = 0;
     let earlyMediaStarted = false;
 
     let backendUrl = '';
@@ -150,6 +154,57 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
         });
         Logger.write(`===MODEL_TEXT_SENT_CLIENT_CONTENT:${tag}===`);
         return 'client_content';
+    };
+
+    const clearClientSilenceTimer = () => {
+        if (clientSilenceTimer) {
+            clearTimeout(clientSilenceTimer);
+            clientSilenceTimer = null;
+        }
+    };
+
+    const scheduleClientSilenceReprompt = (reason) => {
+        clearClientSilenceTimer();
+
+        if (
+            isFinalizing ||
+            isSessionTerminated ||
+            summaryRequestSent ||
+            !geminiLiveAPIClient ||
+            !geminiSocketAlive ||
+            clientSilencePromptCount >= CLIENT_SILENCE_MAX_PROMPTS
+        ) {
+            return;
+        }
+
+        Logger.write(`===CLIENT_SILENCE_TIMER_SCHEDULED:${reason}===`);
+        clientSilenceTimer = setTimeout(() => {
+            clientSilenceTimer = null;
+
+            if (
+                isFinalizing ||
+                isSessionTerminated ||
+                summaryRequestSent ||
+                !geminiLiveAPIClient ||
+                !geminiSocketAlive
+            ) {
+                return;
+            }
+
+            clientSilencePromptCount += 1;
+            const requestText =
+                clientSilencePromptCount === 1
+                    ? 'Клиент не отвечает или его плохо слышно уже около 10 секунд. Скажи ровно одну короткую фразу: "Повторите громче, пожалуйста." Не добавляй объяснений и не переходи к следующему вопросу.'
+                    : 'Клиент по-прежнему молчит или его не слышно. Скажи ровно одну короткую фразу: "Вы на линии? Повторите громче, пожалуйста." Не добавляй объяснений.';
+
+            Logger.write(`===CLIENT_SILENCE_REPROMPT:${clientSilencePromptCount}===`);
+            try {
+                sendUserTextToModel(requestText, 'client_silence_reprompt');
+            } catch (e) {
+                Logger.write('===CLIENT_SILENCE_REPROMPT_ERROR===');
+                Logger.write(String(e));
+            }
+        }, CLIENT_SILENCE_PROMPT_MS);
     };
 
 
@@ -841,6 +896,7 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
+        clearClientSilenceTimer();
 
         requestSummaryViaFunction((summaryReason) => {
             Logger.write(`===FINALIZE_AFTER_SUMMARY:${summaryReason}===`);
@@ -1163,25 +1219,40 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
 — если клиент говорит долго, не прерывай, а потом кратко подведи итог и уточни следующий один момент.
 
 Допустимые живые фразы:
-«Поняла вас»
 «Да, конечно»
 «Хорошо»
-«Угу»
-«Ага»
 «Так, записываю»
 «Спасибо»
 «Ясно»
 «Да, всё верно»
-«Ага, отметил»
+«Записала»
+«Отмечу»
 «Да, дальше»
 «Очень приятно»
 
 Но:
 — не вставляй их в каждое предложение;
 — не превращай речь в набор междометий;
+— не говори «Поняла вас» как универсальную реакцию;
+— не говори «Поняла, спасибо» после непонятной, тихой или пустой реплики;
+— если реплика клиента непонятна, не делай вид, что поняла;
+— отвечай по смыслу последней понятной фразы клиента, а не шаблонной вставкой;
 — не говори театрально;
 — не шути;
 — не будь слишком фамильярным.
+
+Если клиента плохо слышно, он говорит слишком тихо, в расшифровке шум, точка, обрывок, иностранные символы или ты не уверена, что поняла:
+— не угадывай имя, город, материал или смысл ответа;
+— не переходи к следующему пункту сценария;
+— коротко и строго переспроси одной фразой:
+«Повторите громче, пожалуйста.»
+или:
+«Не расслышала, повторите громче, пожалуйста.»
+
+Если после твоего вопроса клиент молчит примерно 10 секунд:
+— один раз спроси: «Повторите громче, пожалуйста.»
+— если тишина продолжается, спроси: «Вы на линии? Повторите громче, пожалуйста.»
+— не заполняй паузу монологом и не говори «Поняла вас».
 
 ==================================================
 О КОМПАНИИ CRYSTAL STONE
@@ -1902,6 +1973,7 @@ ${SUMMARY_FUNCTION_NAME}
                         'Начни разговор с фразы: "Здравствуйте! Меня зовут Екатерина, я менеджер компании Crystal Stone. Скажите, как я могу к вам обращаться?" ' +
                         'Говори естественно и коротко, задавай только один вопрос за раз. ' +
                         'Если клиент сразу объясняет запрос, не перебивай и не возвращайся резко в стартовый скрипт. ' +
+                        'Если ответ клиента непонятен, слишком тихий или похож на шум, не угадывай имя и скажи: "Повторите громче, пожалуйста." ' +
                         'Если клиент диктует номер телефона, не перебивай и дослушивай номер до конца. ' +
                         `Номер из системы: ${callerPhone || 'неизвестен'}. Уточни его актуальность по ходу разговора. ` +
                         `Перед финальным прощанием обязательно вызови функцию ${SUMMARY_FUNCTION_NAME}.`;
@@ -1933,6 +2005,8 @@ ${SUMMARY_FUNCTION_NAME}
                         : '';
 
                 if (inputText) {
+                    clearClientSilenceTimer();
+                    clientSilencePromptCount = 0;
                     if (currentAssistantParts.length) {
                         finalizePhrase('assistant', currentAssistantParts, 'interrupted');
                     }
@@ -1940,6 +2014,7 @@ ${SUMMARY_FUNCTION_NAME}
                 }
 
                 if (outputText) {
+                    clearClientSilenceTimer();
                     if (currentUserParts.length) {
                         finalizePhrase('user', currentUserParts, 'complete');
                     }
@@ -1948,6 +2023,7 @@ ${SUMMARY_FUNCTION_NAME}
 
                 if (payload.interrupted === true) {
                     Logger.write('===AGENT_INTERRUPTED===');
+                    clearClientSilenceTimer();
                     if (currentAssistantParts.length) {
                         finalizePhrase('assistant', currentAssistantParts, 'interrupted');
                     }
@@ -1956,6 +2032,7 @@ ${SUMMARY_FUNCTION_NAME}
 
                 if (payload.turnComplete === true && currentAssistantParts.length) {
                     finalizePhrase('assistant', currentAssistantParts, 'complete');
+                    scheduleClientSilenceReprompt('assistant_turn_complete');
                 }
             });
 
