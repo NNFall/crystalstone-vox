@@ -4,8 +4,10 @@ require(Modules.ApplicationStorage);
 const ANSWER_DELAY_MS = 3000;
 const RINGBACK_COUNTRY = 'RU';
 const SUMMARY_REQUEST_TIMEOUT_MS = 15000;
-const CLIENT_SILENCE_PROMPT_MS = 10000;
-const CLIENT_SILENCE_MAX_PROMPTS = 2;
+const CLIENT_SILENCE_PROMPT_MS = 18000;
+const CLIENT_SILENCE_HANGUP_MS = 40000;
+const CLIENT_SILENCE_HANGUP_GRACE_MS = 5500;
+const CLIENT_SILENCE_MAX_PROMPTS = 1;
 
 const SUMMARY_FUNCTION_NAME = 'save_call_summary';
 
@@ -27,7 +29,9 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
     let answerTimer = null;
     let summaryWaitTimer = null;
     let summaryWaitDone = null;
-    let clientSilenceTimer = null;
+    let clientSilencePromptTimer = null;
+    let clientSilenceHangupTimer = null;
+    let clientSilenceHangupGraceTimer = null;
     let clientSilencePromptCount = 0;
     let earlyMediaStarted = false;
 
@@ -156,15 +160,39 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
         return 'client_content';
     };
 
-    const clearClientSilenceTimer = () => {
-        if (clientSilenceTimer) {
-            clearTimeout(clientSilenceTimer);
-            clientSilenceTimer = null;
+    const clearClientSilencePromptTimer = () => {
+        if (clientSilencePromptTimer) {
+            clearTimeout(clientSilencePromptTimer);
+            clientSilencePromptTimer = null;
         }
     };
 
+    const clearClientSilenceHangupTimer = () => {
+        if (clientSilenceHangupTimer) {
+            clearTimeout(clientSilenceHangupTimer);
+            clientSilenceHangupTimer = null;
+        }
+    };
+
+    const clearClientSilenceHangupGraceTimer = () => {
+        if (clientSilenceHangupGraceTimer) {
+            clearTimeout(clientSilenceHangupGraceTimer);
+            clientSilenceHangupGraceTimer = null;
+        }
+    };
+
+    const clearClientSilenceWaitTimers = () => {
+        clearClientSilencePromptTimer();
+        clearClientSilenceHangupTimer();
+    };
+
+    const clearClientSilenceTimers = () => {
+        clearClientSilenceWaitTimers();
+        clearClientSilenceHangupGraceTimer();
+    };
+
     const scheduleClientSilenceReprompt = (reason) => {
-        clearClientSilenceTimer();
+        clearClientSilencePromptTimer();
 
         if (
             isFinalizing ||
@@ -172,14 +200,57 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
             summaryRequestSent ||
             !geminiLiveAPIClient ||
             !geminiSocketAlive ||
+            clientSilenceHangupGraceTimer ||
             clientSilencePromptCount >= CLIENT_SILENCE_MAX_PROMPTS
         ) {
             return;
         }
 
-        Logger.write(`===CLIENT_SILENCE_TIMER_SCHEDULED:${reason}===`);
-        clientSilenceTimer = setTimeout(() => {
-            clientSilenceTimer = null;
+        Logger.write(`===CLIENT_SILENCE_REPROMPT_TIMER_SCHEDULED:${reason}===`);
+        clientSilencePromptTimer = setTimeout(() => {
+            clientSilencePromptTimer = null;
+
+            if (
+                isFinalizing ||
+                isSessionTerminated ||
+                summaryRequestSent ||
+                !geminiLiveAPIClient ||
+                !geminiSocketAlive ||
+                clientSilenceHangupGraceTimer
+            ) {
+                return;
+            }
+
+            clientSilencePromptCount += 1;
+            const requestText =
+                'Клиент не отвечает или его плохо слышно уже около 18 секунд. Скажи ровно одну короткую фразу: "Повторите громче, пожалуйста." Не добавляй объяснений и не переходи к следующему вопросу.';
+
+            Logger.write(`===CLIENT_SILENCE_REPROMPT:${clientSilencePromptCount}===`);
+            try {
+                sendUserTextToModel(requestText, 'client_silence_reprompt');
+            } catch (e) {
+                Logger.write('===CLIENT_SILENCE_REPROMPT_ERROR===');
+                Logger.write(String(e));
+            }
+        }, CLIENT_SILENCE_PROMPT_MS);
+    };
+
+    const scheduleClientSilenceHangup = (reason) => {
+        if (
+            isFinalizing ||
+            isSessionTerminated ||
+            summaryRequestSent ||
+            !geminiLiveAPIClient ||
+            !geminiSocketAlive ||
+            clientSilenceHangupTimer ||
+            clientSilenceHangupGraceTimer
+        ) {
+            return;
+        }
+
+        Logger.write(`===CLIENT_SILENCE_HANGUP_TIMER_SCHEDULED:${reason}===`);
+        clientSilenceHangupTimer = setTimeout(() => {
+            clientSilenceHangupTimer = null;
 
             if (
                 isFinalizing ||
@@ -191,20 +262,39 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
                 return;
             }
 
-            clientSilencePromptCount += 1;
-            const requestText =
-                clientSilencePromptCount === 1
-                    ? 'Клиент не отвечает или его плохо слышно уже около 10 секунд. Скажи ровно одну короткую фразу: "Повторите громче, пожалуйста." Не добавляй объяснений и не переходи к следующему вопросу.'
-                    : 'Клиент по-прежнему молчит или его не слышно. Скажи ровно одну короткую фразу: "Вы на линии? Повторите громче, пожалуйста." Не добавляй объяснений.';
-
-            Logger.write(`===CLIENT_SILENCE_REPROMPT:${clientSilencePromptCount}===`);
+            Logger.write('===CLIENT_SILENCE_HANGUP_PROMPT===');
             try {
-                sendUserTextToModel(requestText, 'client_silence_reprompt');
+                sendUserTextToModel(
+                    'Клиент молчит или его не слышно уже около 40 секунд. Скажи ровно одну короткую фразу: "Извините, вас не было слышно. Завершу звонок." Не добавляй объяснений.',
+                    'client_silence_hangup'
+                );
             } catch (e) {
-                Logger.write('===CLIENT_SILENCE_REPROMPT_ERROR===');
+                Logger.write('===CLIENT_SILENCE_HANGUP_PROMPT_ERROR===');
                 Logger.write(String(e));
             }
-        }, CLIENT_SILENCE_PROMPT_MS);
+
+            clientSilenceHangupGraceTimer = setTimeout(() => {
+                clientSilenceHangupGraceTimer = null;
+                if (isFinalizing || isSessionTerminated) return;
+
+                Logger.write('===CLIENT_SILENCE_HANGUP_CALL===');
+                try {
+                    if (call && typeof call.hangup === 'function') {
+                        call.hangup();
+                    }
+                } catch (e) {
+                    Logger.write('===CLIENT_SILENCE_CALL_HANGUP_ERROR===');
+                    Logger.write(String(e));
+                }
+
+                finalizeSession('client_silence_hangup');
+            }, CLIENT_SILENCE_HANGUP_GRACE_MS);
+        }, CLIENT_SILENCE_HANGUP_MS);
+    };
+
+    const scheduleClientSilenceTimers = (reason) => {
+        scheduleClientSilenceReprompt(reason);
+        scheduleClientSilenceHangup(reason);
     };
 
 
@@ -896,7 +986,7 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
-        clearClientSilenceTimer();
+        clearClientSilenceTimers();
 
         requestSummaryViaFunction((summaryReason) => {
             Logger.write(`===FINALIZE_AFTER_SUMMARY:${summaryReason}===`);
@@ -1249,9 +1339,9 @@ VoxEngine.addEventListener(AppEvents.CallAlerting, async ({ call }) => {
 или:
 «Не расслышала, повторите громче, пожалуйста.»
 
-Если после твоего вопроса клиент молчит примерно 10 секунд:
+Если после твоего вопроса клиент молчит примерно 18 секунд:
 — один раз спроси: «Повторите громче, пожалуйста.»
-— если тишина продолжается, спроси: «Вы на линии? Повторите громче, пожалуйста.»
+— если тишина продолжается примерно 40 секунд, скажи: «Извините, вас не было слышно. Завершу звонок.»
 — не заполняй паузу монологом и не говори «Поняла вас».
 
 ==================================================
@@ -2005,7 +2095,7 @@ ${SUMMARY_FUNCTION_NAME}
                         : '';
 
                 if (inputText) {
-                    clearClientSilenceTimer();
+                    clearClientSilenceWaitTimers();
                     clientSilencePromptCount = 0;
                     if (currentAssistantParts.length) {
                         finalizePhrase('assistant', currentAssistantParts, 'interrupted');
@@ -2014,7 +2104,7 @@ ${SUMMARY_FUNCTION_NAME}
                 }
 
                 if (outputText) {
-                    clearClientSilenceTimer();
+                    clearClientSilencePromptTimer();
                     if (currentUserParts.length) {
                         finalizePhrase('user', currentUserParts, 'complete');
                     }
@@ -2023,7 +2113,7 @@ ${SUMMARY_FUNCTION_NAME}
 
                 if (payload.interrupted === true) {
                     Logger.write('===AGENT_INTERRUPTED===');
-                    clearClientSilenceTimer();
+                    clearClientSilenceWaitTimers();
                     if (currentAssistantParts.length) {
                         finalizePhrase('assistant', currentAssistantParts, 'interrupted');
                     }
@@ -2032,7 +2122,7 @@ ${SUMMARY_FUNCTION_NAME}
 
                 if (payload.turnComplete === true && currentAssistantParts.length) {
                     finalizePhrase('assistant', currentAssistantParts, 'complete');
-                    scheduleClientSilenceReprompt('assistant_turn_complete');
+                    scheduleClientSilenceTimers('assistant_turn_complete');
                 }
             });
 
