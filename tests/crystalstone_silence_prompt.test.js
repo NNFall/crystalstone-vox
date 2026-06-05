@@ -22,5 +22,8 @@ assert.match(source, /«Угу»/);
 assert.match(source, /«Ага»/);
 assert.match(source, /не спрашивай повторно, какое изделие нужно/i);
 assert.match(source, /если клиент уже сказал, что нужна столешница/i);
+assert.match(source, /если спрашиваешь «Остались ли у вас еще вопросы\?»/i);
+assert.match(source, /обязательно остановись на этом вопросе/i);
+assert.match(source, /прощание разрешено только после отдельного ответа клиента/i);
 
 console.log('crystalstone_silence_prompt.test.js passed');
