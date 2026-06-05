@@ -25,5 +25,8 @@ assert.match(source, /если клиент уже сказал, что нужн
 assert.match(source, /если спрашиваешь «Остались ли у вас еще вопросы\?»/i);
 assert.match(source, /обязательно остановись на этом вопросе/i);
 assert.match(source, /прощание разрешено только после отдельного ответа клиента/i);
+assert.match(source, /после ответа клиента, что вопросов больше нет, скажи только одну финальную фразу/i);
+assert.match(source, /не повторяй «Всего доброго» второй раз/i);
+assert.match(source, /не добавляй второе прощание/i);
 
 console.log('crystalstone_silence_prompt.test.js passed');
